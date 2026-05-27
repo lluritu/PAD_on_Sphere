@@ -59,7 +59,7 @@ def calculate_attributions_from_numpy(
     lon1,
     lat2=None,
     lon2=None,
-    same_grid="True",
+    same_grid=True,
     distance_cutoff=100 * 1000 * 1000,
 ):
     """Compute Precipitation Attributions (i.e. the Optimal Transport Plan) with the PAD-on-sphere method (Skok and Lledó 2025) from numpy arrays.
