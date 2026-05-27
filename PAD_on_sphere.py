@@ -410,13 +410,13 @@ def calculate_attributions_from_xarrays(
         )
     else:
         results = libc.calculate_PAD_results_assume_different_grid_ctypes(
-            lat1,
-            lon1,
-            values1,
+            fcst.lat.values,
+            fcst.lon.values,
+            fcst.values,
             ngridpoints1,
-            lat2,
-            lon2,
-            values2,
+            obs.lat.values,
+            obs.lon.values,
+            obs.values,
             ngridpoints2,
             byref(c_number_of_attributions),
             distance_cutoff,
