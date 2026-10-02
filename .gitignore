@@ -1,0 +1,9 @@
+# Compiled shared library: build it from source_for_Cxx_shared_library/
+*.so
+
+# Local build script (ECMWF-specific)
+source_for_Cxx_shared_library/makefile
+
+# Python / Jupyter caches
+__pycache__/
+.ipynb_checkpoints/
