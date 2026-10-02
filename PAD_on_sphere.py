@@ -419,7 +419,7 @@ def calculate_attributions_from_xarrays(
             obs.values,
             ngridpoints2,
             byref(c_number_of_attributions),
-            distance_cutoff,
+            cutoff,
         )
 
     number_of_attributions = c_number_of_attributions.value
