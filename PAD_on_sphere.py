@@ -1,520 +1,270 @@
+"""ctypes interface for PAD on a sphere (requires wrapper ABI version 3).
+
+Cutoffs and returned distances are great-circle
+distances. Invalid inputs raise Python exceptions. Rebuild the shared library
+after updating the C++ wrapper.
+"""
+import ctypes as ct
+import operator
+from pathlib import Path
+
 import numpy as np
-import xarray as xr
 import pandas as pd
-import os
-from ctypes import *
-from PAD_postprocess import aggregate_transportplan_at_gridpoints, get_latlon_df
+import xarray as xr
 
-# -----------------------------------------------------------------------------------------------------
-# Definitions for the C++ library calls
-# -----------------------------------------------------------------------------------------------------
-
-# search for the PAD C++ shared library file (PAD_on_sphere_Cxx_shared_library.so) in the same folder
-libc = CDLL(
-    os.path.abspath(os.path.expanduser(os.path.dirname(__file__)))
-    + os.path.sep
-    + "PAD_on_sphere_Cxx_shared_library.so"
-)
-
-# define data types of library functions
-ND_POINTER_1D = np.ctypeslib.ndpointer(dtype=np.float64, ndim=1, flags="C")
-libc.free_mem_double_array.argtypes = [POINTER(c_double)]
-libc.free_mem_double_array.restype = None
-libc.calculate_PAD_results_assume_same_grid_ctypes.argtypes = [
-    ND_POINTER_1D,
-    ND_POINTER_1D,
-    ND_POINTER_1D,
-    ND_POINTER_1D,
-    c_size_t,
-    POINTER(c_size_t),
-    c_double,
-]
-libc.calculate_PAD_results_assume_same_grid_ctypes.restype = POINTER(c_double)
-libc.calculate_PAD_results_assume_different_grid_ctypes.argtypes = [
-    ND_POINTER_1D,
-    ND_POINTER_1D,
-    ND_POINTER_1D,
-    c_size_t,
-    ND_POINTER_1D,
-    ND_POINTER_1D,
-    ND_POINTER_1D,
-    c_size_t,
-    POINTER(c_size_t),
-    c_double,
-]
-libc.calculate_PAD_results_assume_different_grid_ctypes.restype = POINTER(c_double)
-
-# -----------------------------------------------------------------------------------------------------
-# Numpy wrapper functions
-# -----------------------------------------------------------------------------------------------------
-
-# Constant used for the Numpy examples
 Earth_radius = 6371.0 * 1000.0
+libc = ct.CDLL(str(Path(__file__).resolve().parent / "PAD_on_sphere_Cxx_shared_library.so"))
+try:
+    libc.PAD_wrapper_abi_version.argtypes = []
+    libc.PAD_wrapper_abi_version.restype = ct.c_int
+except AttributeError as exc:
+    raise ImportError("Rebuild PAD_on_sphere_Cxx_shared_library.so: wrapper ABI 3 required.") from exc
+if libc.PAD_wrapper_abi_version() != 3:
+    raise ImportError("Incompatible PAD shared library: wrapper ABI 3 required.")
 
-
-def calculate_attributions_from_numpy(
-    values1,
-    values2,
-    lat1,
-    lon1,
-    lat2=None,
-    lon2=None,
-    same_grid="True",
-    distance_cutoff=100 * 1000 * 1000,
-):
-    """Compute Precipitation Attributions (i.e. the Optimal Transport Plan) with the PAD-on-sphere method (Skok and Lledó 2025) from numpy arrays.
-
-    :param ndarray values1: field1 total precipitation in mm.
-    :param ndarray values2: field2 total precipitation in mm.
-    :param ndarray lat1: latitudes of field1.
-    :param ndarray lon1: longitudes of field1.
-    :param ndarray lat2: latitudes of field2.
-    :param ndarray lon2: longitudes of field2.
-    :param bool same_grid: whether field1 and field2 are in the same grid.
-    :param int distance_cutoff: cutoff distance in m.
-
-    :return: a numpy array with attributed precipitation and two arrays with unattributed precipitation in each field.
-
-    """
-
-    if same_grid:
-        if (lat2 is not None) or (lon2 is not None):
-            print(
-                'ERROR: lat2, lon2 were provided but same_grid=True !. Returning "None" as result!'
-            )
-            return None
-    else:
-        if (lat2 is None) or (lon2 is None):
-            print(
-                'ERROR: lat2, lon2 arrays not provided but same_grid=False !. Returning "None" as result!'
-            )
-            return None
-
-    # check input arrays
-    if check_input_array(lat1, "lat1") == False:
-        return None
-    if check_input_array(lon1, "lon1") == False:
-        return None
-    if check_input_array(values1, "values1") == False:
-        return None
-    if check_input_array(values2, "values2") == False:
-        return None
-    if not same_grid:
-        if check_input_array(lat2, "lat2") == False:
-            return None
-        if check_input_array(lon2, "lon2") == False:
-            return None
-
-    # check dimensions of fields
-    if lat1.shape != lon1.shape or lat1.shape != values1.shape:
-        print(
-            'ERROR: the lat1, lon1, values1 arrays do not have the same shape !. Returning "None" as result!'
-        )
-        return None
-    if same_grid:
-        if lat1.shape != values2.shape:
-            print(
-                'ERROR: the lat1, lon1, values2 arrays do not have the same shape !. Returning "None" as result!'
-            )
-            return None
-    else:
-        if lat2.shape != lon2.shape or lat2.shape != values2.shape:
-            print(
-                'ERROR: the lat2, lon2 and values2 arrays do not have the same shape !. Returning "None" as result!'
-            )
-            return None
-
-    # detect negative values
-    if values1[values1 < 0].size > 0 or values2[values2 < 0].size > 0:
-        print(
-            'ERROR: the values1 or values2 array contains some negative values, which is not allowed . Returning "None" as result!'
-        )
-        return None
-
-    # check if all the values are zero
-    if np.sum(values1) == 0 or np.sum(values2) == 0:
-        print(
-            'ERROR: the values1 or values2 array contains only zeroes, which is not allowed . Returning "None" as result!'
-        )
-        return None
-
-    # cast distance to float64 and ensure it is positive
-    distance_cutoff = np.float64(distance_cutoff)
-    if distance_cutoff <= 0:
-        distance_cutoff = 1e99
-
-    # if needed make a copy and cast to float64 - just in case the input fields are integers
-    if lat1.dtype != np.float64:
-        lat1 = lat1.astype(np.float64, copy=True)
-    if lon1.dtype != np.float64:
-        lon1 = lon1.astype(np.float64, copy=True)
-    if values1.dtype != np.float64:
-        values1 = values1.astype(np.float64, copy=True)
-    if values2.dtype != np.float64:
-        values2 = values2.astype(np.float64, copy=True)
-    if not same_grid:
-        if lat2.dtype != np.float64:
-            lat2 = lat2.astype(np.float64, copy=True)
-        if lon2.dtype != np.float64:
-            lon2 = lon2.astype(np.float64, copy=True)
-
-    # convert to C_CONTIGUOUS arrays if needed (these are required by C++)
-    if lat1.flags["C_CONTIGUOUS"] != True:
-        lat1 = np.ascontiguousarray(lat1)
-    if lon1.flags["C_CONTIGUOUS"] != True:
-        lon1 = np.ascontiguousarray(lon1)
-    if values1.flags["C_CONTIGUOUS"] != True:
-        values1 = np.ascontiguousarray(values1)
-    if values2.flags["C_CONTIGUOUS"] != True:
-        values2 = np.ascontiguousarray(values2)
-    if not same_grid:
-        if lat2.flags["C_CONTIGUOUS"] != True:
-            lat2 = np.ascontiguousarray(lat2)
-        if lon2.flags["C_CONTIGUOUS"] != True:
-            lon2 = np.ascontiguousarray(lon2)
-
-    c_number_of_attributions = c_size_t()
-
-    ngridpoints1 = lat1.shape[0]
-    if same_grid:
-        ngridpoints2 = ngridpoints1
-        results = libc.calculate_PAD_results_assume_same_grid_ctypes(
-            lat1,
-            lon1,
-            values1,
-            values2,
-            ngridpoints1,
-            byref(c_number_of_attributions),
-            distance_cutoff,
-        )
-    else:
-        ngridpoints2 = lat2.shape[0]
-        results = libc.calculate_PAD_results_assume_different_grid_ctypes(
-            lat1,
-            lon1,
-            values1,
-            ngridpoints1,
-            lat2,
-            lon2,
-            values2,
-            ngridpoints2,
-            byref(c_number_of_attributions),
-            distance_cutoff,
-        )
-
-    number_of_attributions = c_number_of_attributions.value
-
-    # Deserialize
-    attributions = np.asarray(results[0 : number_of_attributions * 4]).reshape(
-        number_of_attributions, -1
-    )
-    non_attributed_values1 = np.asarray(
-        results[
-            (number_of_attributions * 4) : (number_of_attributions * 4 + ngridpoints1)
-        ]
-    )
-    non_attributed_values2 = np.asarray(
-        results[
-            (number_of_attributions * 4 + ngridpoints1) : (
-                number_of_attributions * 4 + ngridpoints1 + ngridpoints2
-            )
-        ]
-    )
-
-    libc.free_mem_double_array(results)
-
-    return [attributions, non_attributed_values1, non_attributed_values2]
-
-
-def calculate_PAD_on_sphere_from_attributions(PAD_attributions):
-    """Compute the volume-weighted mean of the attribution distances.
-
-    :param ndarray PAD_atributions: an array containing distances in the first column and volume in the second column.
-
-    :return: the average PAD value of a list of attributions.
-
-    """
-    return np.sum(PAD_attributions[:, 0] * PAD_attributions[:, 1]) / np.sum(
-        PAD_attributions[:, 1]
-    )
+ND_POINTER_1D = np.ctypeslib.ndpointer(
+    dtype=np.float64, ndim=1, flags=("C_CONTIGUOUS", "ALIGNED")
+)
+libc.free_mem_double_array.argtypes = [ct.POINTER(ct.c_double)]
+libc.free_mem_double_array.restype = None
+libc.PAD_last_error.argtypes = []
+libc.PAD_last_error.restype = ct.c_char_p
+libc.calculate_PAD_results_assume_same_grid_ctypes.argtypes = [
+    ND_POINTER_1D, ND_POINTER_1D, ND_POINTER_1D, ND_POINTER_1D,
+    ct.c_size_t, ct.POINTER(ct.c_size_t), ct.c_double, ct.c_int64,
+]
+libc.calculate_PAD_results_assume_same_grid_ctypes.restype = ct.POINTER(ct.c_double)
+libc.calculate_PAD_results_assume_different_grid_ctypes.argtypes = [
+    ND_POINTER_1D, ND_POINTER_1D, ND_POINTER_1D, ct.c_size_t,
+    ND_POINTER_1D, ND_POINTER_1D, ND_POINTER_1D, ct.c_size_t,
+    ct.POINTER(ct.c_size_t), ct.c_double, ct.c_int64,
+]
+libc.calculate_PAD_results_assume_different_grid_ctypes.restype = ct.POINTER(ct.c_double)
 
 
 def check_input_array(f, name):
-    """Check the input numpy arrays for the right dimension and contents.
+    """Validate a nonempty, finite, one-dimensional real NumPy array.
 
-    :param ndarray f: a numpy array.
-    :param str name: the name of the parameter.
-
-    :return: True if all tests successful, otherwise False.
-
+    Returns True on success; raises TypeError or ValueError on invalid input.
+    Masked arrays are deliberately rejected.
     """
-
-    # test if fields are numpy arrays
-    if type(f) is not np.ndarray:
-        print(
-            "ERROR: the "
-            + name
-            + ' input array is not a numpy array of type numpy.ndarray, which is not permitted! Perhaps it is a masked arrays, which is also not permitted. Returning "None" as result!'
-        )
-        return False
-
-    # check dimensions of fields
-    if f.ndim != 1:
-        print(
-            "ERROR: the "
-            + name
-            + ' input array is not one-dimensional, which is not permitted!. Returning "None" as result!'
-        )
-        return False
-
-    # check if the array has some elements
-    if f.size == 0:
-        print(
-            "ERROR: the "
-            + name
-            + ' array does not contain any elements. Returning "None" as result!'
-        )
-        return False
-
-    # detect non-numeric values
-    result = np.where(np.isfinite(f) == False)
-    if len(result[0]) > 0:
-        print(
-            "ERROR: the "
-            + name
-            + ' arrays contains some non-numeric values, which is not permitted!. Returning "None" as result!'
-        )
-        return False
-
-    # detect masked array
-    if isinstance(f, np.ma.MaskedArray):
-        print(
-            "ERROR: the "
-            + name
-            + ' array is a masked array which is not permitted. Returning "None" as result!'
-        )
-        return False
-
+    if not isinstance(f, np.ndarray) or isinstance(f, np.ma.MaskedArray):
+        raise TypeError(f"{name} must be an unmasked NumPy array.")
+    if f.ndim != 1 or f.size == 0:
+        raise ValueError(f"{name} must be a nonempty one-dimensional array.")
+    if not np.issubdtype(f.dtype, np.number) or np.iscomplexobj(f):
+        raise TypeError(f"{name} must contain real numeric values.")
+    if not np.all(np.isfinite(f)):
+        raise ValueError(f"{name} must contain only finite values.")
     return True
 
 
-# -----------------------------------------------------------------------------------------------------
-# Xarray wrapper functions
-# -----------------------------------------------------------------------------------------------------
+def _array(f, name):
+    check_input_array(f, name)
+    converted = np.require(f, dtype=np.float64, requirements=["C", "A"])
+    if not np.all(np.isfinite(converted)):
+        raise ValueError(f"{name} must be representable as finite float64 values.")
+    return converted
+
+
+def _seed(random_seed):
+    if random_seed is None:
+        return -1
+    if isinstance(random_seed, (bool, np.bool_)):
+        raise TypeError("random_seed must be an integer, not a boolean.")
+    seed = operator.index(random_seed)
+    if seed < -1 or seed > 0xFFFFFFFF:
+        raise ValueError("random_seed must be None, -1, or an unsigned 32-bit integer.")
+    return seed
+
+
+def _cutoff(value):
+    value = float(value)
+    if not np.isfinite(value) or value < 0:
+        raise ValueError("Great-circle distance cutoff must be finite and nonnegative.")
+    return value
+
+
+def calculate_attributions_from_numpy(
+    values1, values2, lat1, lon1, lat2=None, lon2=None,
+    same_grid=True, distance_cutoff=100 * 1000 * 1000, random_seed=None,
+):
+    """Calculate PAD attributions from one-dimensional arrays.
+
+    Latitude/longitude are degrees. Amounts must be finite and nonnegative,
+    with at least one positive amount per field. They are attributed as supplied:
+    pass volumes for volume-weighted PAD; no area conversion occurs here.
+    distance_cutoff is a great-circle distance in metres (zero is allowed).
+    random_seed=None or -1 chooses and prints a random seed; an explicit uint32
+    seed gives reproducibility with identical inputs and code/library versions.
+
+    Returns [attributions, remaining1, remaining2]. Attribution shape is (N, 4),
+    including (0, 4) when no matches satisfy the cutoff. Columns are great-circle
+    distance in metres, amount, original index1, original index2. Indices in this
+    homogeneous float64 array are exactly representable for the supported sizes.
+    same_grid=True means identical coordinates in identical order.
+    """
+    if not isinstance(same_grid, (bool, np.bool_)):
+        raise TypeError("same_grid must be a boolean.")
+    seed = _seed(random_seed)
+    cutoff = _cutoff(distance_cutoff)
+    if same_grid:
+        if lat2 is not None or lon2 is not None:
+            raise ValueError("Do not supply lat2/lon2 when same_grid=True.")
+    elif lat2 is None or lon2 is None:
+        raise ValueError("lat2 and lon2 are required when same_grid=False.")
+
+    lat1, lon1 = _array(lat1, "lat1"), _array(lon1, "lon1")
+    values1, values2 = _array(values1, "values1"), _array(values2, "values2")
+    if lat1.shape != lon1.shape or lat1.shape != values1.shape:
+        raise ValueError("lat1, lon1 and values1 must have identical shapes.")
+    if same_grid:
+        if values1.shape != values2.shape:
+            raise ValueError("Same-grid fields must have identical shapes.")
+        lat2, lon2 = lat1, lon1
+    else:
+        lat2, lon2 = _array(lat2, "lat2"), _array(lon2, "lon2")
+        if lat2.shape != lon2.shape or lat2.shape != values2.shape:
+            raise ValueError("lat2, lon2 and values2 must have identical shapes.")
+    for lat in (lat1, lat2):
+        if np.any(np.abs(lat) > 90):
+            raise ValueError("Latitudes must be between -90 and 90 degrees.")
+    for values in (values1, values2):
+        if np.any(values < 0) or not np.any(values > 0):
+            raise ValueError("Each field must be nonnegative with at least one positive amount.")
+        if values.size > np.iinfo(np.int32).max:
+            raise ValueError("Too many grid points for the C++ tree.")
+
+    count = ct.c_size_t()
+    if same_grid:
+        result = libc.calculate_PAD_results_assume_same_grid_ctypes(
+            lat1, lon1, values1, values2, values1.size,
+            ct.byref(count), cutoff, seed,
+        )
+    else:
+        result = libc.calculate_PAD_results_assume_different_grid_ctypes(
+            lat1, lon1, values1, values1.size,
+            lat2, lon2, values2, values2.size, ct.byref(count), cutoff, seed,
+        )
+    if not result:
+        message = libc.PAD_last_error()
+        raise RuntimeError(message.decode("utf-8", errors="replace") if message else "PAD calculation failed.")
+    try:
+        n = count.value
+        if n > values1.size + values2.size:
+            raise RuntimeError("Invalid attribution count returned by PAD.")
+        total = 4 * n + values1.size + values2.size
+        # One owned copy, without creating millions of Python float objects.
+        packed = np.ctypeslib.as_array(result, shape=(total,)).copy()
+        attributions = packed[:4 * n].reshape(n, 4)
+        remaining1 = packed[4 * n:4 * n + values1.size]
+        remaining2 = packed[4 * n + values1.size:]
+        return [attributions, remaining1, remaining2]
+    finally:
+        libc.free_mem_double_array(result)
+
+
+def calculate_PAD_on_sphere_from_attributions(PAD_attributions):
+    """Return the amount-weighted mean distance; reject undefined/invalid input."""
+    rows = np.asarray(PAD_attributions, dtype=np.float64)
+    if rows.ndim != 2 or rows.shape[1] < 2 or rows.shape[0] == 0:
+        raise ValueError("PAD requires a nonempty attribution array with at least two columns.")
+    distances, weights = rows[:, 0], rows[:, 1]
+    if (not np.all(np.isfinite(distances)) or not np.all(np.isfinite(weights))
+            or np.any(distances < 0) or np.any(weights < 0) or not np.any(weights > 0)):
+        raise ValueError("PAD requires finite nonnegative distances and positive total weight.")
+    # Scale before products/sums to avoid overflow for large finite amounts.
+    weights = weights / weights.max()
+    scale = distances.max()
+    if scale == 0:
+        return 0.0
+    fraction = np.sum((distances / scale) * weights) / np.sum(weights)
+    return float(min(fraction, 1.0) * scale)
+
+
+def _dataarray(array, name, coordinates=False):
+    if not isinstance(array, xr.DataArray) or array.dims != ("gridpoint",):
+        raise ValueError(f"{name} must be an xarray DataArray with only the gridpoint dimension.")
+    if coordinates:
+        for coordinate in ("lat", "lon"):
+            if coordinate not in array.coords or array[coordinate].dims != ("gridpoint",):
+                raise ValueError(f"{name} needs one-dimensional lat/lon coordinates.")
+    return array
 
 
 def calculate_attributions_from_xarrays(
-    fcst, obs, area, area2=None, same_grid=True, cutoff=3000, gridded_output=True
+    fcst, obs, area, area2=None, same_grid=True, cutoff=3000,
+    residual_as_df=False, random_seed=None,
 ):
-    """Compute Precipitation Attributions (i.e. the Optimal Transport Plan) with the PAD-on-sphere method (Skok and Lledó 2025) from xarray datasets.
+    """Calculate PAD for precipitation (mm) and cell areas (km^2).
 
-    :param xarray fcst: should contain tp in mm.
-    :param xarray obs: should contain tp in mm.
-    :param xarray area: fcst grid cell area in km^2.
-    :param xarray area2: obs grid cell area in km^2, if same_grid is False.
-    :param int cutoff: cutoff distance in km.
-    :param bool gridded_output: if True the output is recasted from pandas dataframes to a gridded xarray dataset. Only possible if same_grid=True.
-
-    :return: a list with a pandas dataframe containing all attributions, and additionally, depending on the options: if same_grid=True and gridded_output=True an xarray dataset containing volume transported, distance transported, and residual error in mm at each grid point. if same_grid=True and gridded_output=False, a pandas dataframe with non-attributed precipitation. If same_grid=False, two xarray datasets with non-attributed precipitation from each field. For the gridded outputs, positive distances represent a water export at origin (fcst > obs) and negative distances represent a water import at destination (fcst < obs). Similarly, positive residual errors represent overforecasting (fcst>obs) and viceversa.
-
+    cutoff is great-circle distance in km.
+    random_seed follows calculate_attributions_from_numpy.
+    Returns (transport_dataframe, residual). Distances retain floating-point
+    precision in metres; index columns are integers. For same grids, residual
+    is a Dataset in mm (or a filtered DataFrame with residual_as_df=True).
+    For different grids, residual is [remaining_forecast, remaining_observation]
+    in m^3; residual_as_df is not supported.
     """
+    if not isinstance(same_grid, (bool, np.bool_)):
+        raise TypeError("same_grid must be a boolean.")
+    _dataarray(fcst, "fcst", True)
+    _dataarray(obs, "obs", True)
+    _dataarray(area, "area")
     if same_grid:
+        if area2 is not None:
+            raise ValueError("Do not supply area2 when same_grid=True.")
         area2 = area
+    elif residual_as_df:
+        raise ValueError("residual_as_df is supported only for same-grid fields.")
+    _dataarray(area2, "area2")
 
-    # Check input data
-    if not isinstance(fcst, xr.DataArray):
-        print("fcst should be an xarray DataArray")
-        return None
-    if not isinstance(obs, xr.DataArray):
-        print("obs should be an xarray DataArray")
-        return None
-    if not isinstance(area, xr.DataArray):
-        print("area should be an xarray DataArray")
-        return None
-    if not isinstance(area2, xr.DataArray):
-        print("area2  should be an xarray DataArray")
-        return None
-
-    if not fcst.dims == ("gridpoint",):
-        print("fcst should have (only) a gridpoint dimension")
-        return None
-    if not obs.dims == ("gridpoint",):
-        print("obs should have (only) a gridpoint dimension")
-        return None
-    if not area.dims == ("gridpoint",):
-        print("area should have (only) a gridpoint dimension")
-        return None
-    if not area2.dims == ("gridpoint",):
-        print("area2 should have (only) a gridpoint dimension")
-        return None
-
-    if fcst.sizes != area.sizes:
-        print("The area and fcst DataArrays are not aligned")
-        return None
-    if obs.sizes != area2.sizes:
-        print("The area2 and obs DataArrays are not aligned")
-        return None
-
-    # Compute water volume (in m^3) from tp (or height in mm) and grid-cell area (in km^2)
-    # vol_in_m3 = fcst_in_mm / 1000 * area_in_km2 * 1000 * 1000
-    fcst = fcst * area * 1000
-    obs = obs * area2 * 1000
-
-    # Convert cutoff from km to m
-    # cast distance to float64 and ensure it is positive
-    cutoff = np.float64(cutoff)
-    cutoff *= 1000
-    if cutoff <= 0:
-        print("ERROR: negative cutoff not allowed")
-        return None
-
-    # Check for negative values
-    if (fcst < 0).any() or (obs < 0).any():
-        print("ERROR: negative values not allowed")
-        return None
-    # Check for nan, inf and a positive sum.
-    total_fcst = fcst.sum(skipna=False)
-    total_obs = obs.sum(skipna=False)
-    if total_fcst <= 0 or total_obs <= 0:
-        print("ERROR: all-zero fields not allowed")
-        return None
-    if total_fcst.isnull() or total_obs.isnull():
-        print("ERROR: NaN values not allowed")
-        return None
-    if total_fcst == np.inf or total_obs == np.inf:
-        print("ERROR: infinite values not allowed")
-        return None
-
-    # Cast the data to C_contiguous float64 type
-    fcst = fcst.astype("float64", order="C")
-    fcst["lat"] = fcst.lat.astype("float64", order="C")
-    fcst["lon"] = fcst.lon.astype("float64", order="C")
-    obs = obs.astype("float64", order="C")
-    obs["lat"] = obs.lat.astype("float64", order="C")
-    obs["lon"] = obs.lon.astype("float64", order="C")
-
-    c_number_of_attributions = c_size_t()
-
-    ngridpoints1 = fcst.sizes["gridpoint"]
-    ngridpoints2 = obs.sizes["gridpoint"]
-
+    # Exact joins reject different/reordered indexes instead of silently dropping
+    # points during xarray arithmetic. Positional sizes must also match.
+    fcst, area = xr.align(fcst, area, join="exact", copy=False)
+    obs, area2 = xr.align(obs, area2, join="exact", copy=False)
+    if fcst.sizes != area.sizes or obs.sizes != area2.sizes:
+        raise ValueError("Each area array must match its field.")
     if same_grid:
-        results = libc.calculate_PAD_results_assume_same_grid_ctypes(
-            fcst.lat.values,
-            fcst.lon.values,
-            fcst.values,
-            obs.values,
-            ngridpoints1,
-            byref(c_number_of_attributions),
-            cutoff,
-        )
-    else:
-        results = libc.calculate_PAD_results_assume_different_grid_ctypes(
-            lat1,
-            lon1,
-            values1,
-            ngridpoints1,
-            lat2,
-            lon2,
-            values2,
-            ngridpoints2,
-            byref(c_number_of_attributions),
-            distance_cutoff,
-        )
+        fcst, obs = xr.align(fcst, obs, join="exact", copy=False)
+        if fcst.sizes != obs.sizes:
+            raise ValueError("Same-grid fields must have identical lengths.")
+        for coordinate in ("lat", "lon"):
+            if not np.array_equal(fcst[coordinate].values, obs[coordinate].values):
+                raise ValueError("Same-grid fields must have identical lat/lon coordinates in the same order.")
 
-    number_of_attributions = c_number_of_attributions.value
+    amounts = []
+    for field, cell_area, name in ((fcst, area, "fcst"), (obs, area2, "obs")):
+        precipitation = _array(field.values, name)
+        areas = _array(cell_area.values, name + " area")
+        if np.any(precipitation < 0) or np.any(areas <= 0):
+            raise ValueError("Precipitation must be nonnegative and cell areas strictly positive.")
+        with np.errstate(over="raise", invalid="raise"):
+            amounts.append(precipitation * areas * 1000.0)
 
-    # Deserialize
-    attributions = np.asarray(results[0 : number_of_attributions * 4]).reshape(
-        number_of_attributions, -1
+    distance_cutoff = _cutoff(_cutoff(cutoff) * 1000.0)
+    attributions, remaining1, remaining2 = calculate_attributions_from_numpy(
+        amounts[0], amounts[1], fcst.lat.values, fcst.lon.values,
+        lat2=None if same_grid else obs.lat.values,
+        lon2=None if same_grid else obs.lon.values,
+        same_grid=same_grid, distance_cutoff=distance_cutoff, random_seed=random_seed,
     )
-    non_attributed_values1 = np.asarray(
-        results[
-            (number_of_attributions * 4) : (number_of_attributions * 4 + ngridpoints1)
-        ]
+    transport = pd.DataFrame(
+        attributions, columns=["distance_m", "volume_m3", "gridpoint_fcst", "gridpoint_obs"]
     )
-    non_attributed_values2 = np.asarray(
-        results[
-            (number_of_attributions * 4 + ngridpoints1) : (
-                number_of_attributions * 4 + ngridpoints1 + ngridpoints2
-            )
-        ]
+    for column in ("gridpoint_fcst", "gridpoint_obs"):
+        transport[column] = transport[column].astype(np.int64)
+    if not same_grid:
+        return transport, [remaining1, remaining2]
+
+    coords = {"lat": fcst.lat, "lon": fcst.lon}
+    if "gridpoint" in fcst.coords:
+        coords["gridpoint"] = fcst.gridpoint
+    residual = xr.Dataset(
+        {"error": ("gridpoint", (remaining1 - remaining2) / _array(area.values, "area") / 1000.0)},
+        coords=coords,
     )
-
-    libc.free_mem_double_array(results)
-
-    # Create a dataframe with the transport plan
-    transportplan_df = pd.DataFrame(
-        attributions,
-        columns=["distance_m", "volume_m3", "gridpoint_fcst", "gridpoint_obs"],
-    )
-    # Round distance and gridpoint columns to integer
-    transportplan_df[["distance_m", "gridpoint_fcst", "gridpoint_obs"]] = (
-        transportplan_df[["distance_m", "gridpoint_fcst", "gridpoint_obs"]].astype(int)
-    )
-
-    if same_grid:
-        # Compute residual error as fcst_nonattributed - obs_nonattributed
-        residual_error_ds = xr.Dataset(
-            data_vars=dict(
-                error=(
-                    ["gridpoint"],
-                    (non_attributed_values1 - non_attributed_values2),
-                ),
-            ),
-            coords={
-                "gridpoint": fcst.gridpoint,
-                "lat": fcst.lat,
-                "lon": fcst.lon,
-            },
-        )
-
-        # Convert residual error back from volume (in m^3) to height (in mm)
-        # error_mm = error_m3 / (area_km2 * 1000 * 1000) * 1000
-        residual_error_ds /= area * 1000
-
-        if gridded_output:
-            # Convert the attributions list to a gridded xarray
-            latlon_df = get_latlon_df(obs)
-            transportplan_ds = (
-                aggregate_transportplan_at_gridpoints(transportplan_df, latlon_df)
-                .to_xarray()
-                .set_coords(("lat", "lon"))
-            )
-            gridded_ds = xr.merge((transportplan_ds, residual_error_ds)).drop_vars(
-                "gridpoint"
-            )
-            return (transportplan_df, gridded_ds)
-
-        else:
-            # Conversion of residual error back to pandas df
-            residual_df = residual_error_ds.to_dataframe()
-            residual_df = residual_df[residual_df.error != 0]
-            return (transportplan_df, residual_df)
-
-    else:
-        # Create two residual error datasets, one in each grid
-        residual_error_fcst = xr.Dataset(
-            data_vars=dict(error=(["gridpoint"], non_attributed_values1)),
-            coords={
-                "gridpoint": fcst.gridpoint,
-                "lat": fcst.lat,
-                "lon": fcst.lon,
-            },
-        )
-
-        residual_error_obs = xr.Dataset(
-            data_vars=dict(error=(["gridpoint"], non_attributed_values2)),
-            coords={
-                "gridpoint": obs.gridpoint,
-                "lat": obs.lat,
-                "lon": obs.lon,
-            },
-        )
-
-        # Convert residual error back from volume (in m^3) to height (in mm)
-        # error_mm = error_m3 / (area_km2 * 1000 * 1000) * 1000
-        residual_error_fcst /= area * 1000
-        residual_error_obs /= area2 * 1000
-
-        return (transportplan_df, residual_error_fcst, residual_error_obs)
+    if residual_as_df:
+        residual = residual.to_dataframe()
+        residual = residual.loc[residual["error"] != 0]
+    return transport, residual

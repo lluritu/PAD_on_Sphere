@@ -14,13 +14,15 @@ def weighted_average(df, data_col, weight_col, by_col):
     :return: pandas dataframe with weighted average for each group.
 
     """
-    df["_data_times_weight"] = df[data_col] * df[weight_col]
-    df["_weight_where_notnull"] = df[weight_col] * pd.notnull(df[data_col])
-    g = df.groupby(by_col)
+    # Preserve grouping by either a column or an index level without modifying
+    # the caller's data, even if it already contains our temporary column names.
+    working = df[[by_col]].copy() if by_col in df.columns else pd.DataFrame(index=df.index)
+    working["_data_times_weight"] = df[data_col] * df[weight_col]
+    working["_weight_where_notnull"] = df[weight_col] * pd.notnull(df[data_col])
+    g = working.groupby(by_col)
     total = g["_weight_where_notnull"].sum()
     result = g["_data_times_weight"].sum() / total
 
-    del df["_data_times_weight"], df["_weight_where_notnull"]
     return pd.concat([total.rename("volume"), result.rename("distance")], axis=1)
 
 

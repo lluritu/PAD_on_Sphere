@@ -50,7 +50,7 @@ values_prec_volume1 = values1 / 1000.0 * grid_point_area_size
 values_prec_volume2 = values2 / 1000.0 * grid_point_area_size
 
 # ------------------------------------------------------------------------------------------------------------------------
-# Calculate PAD results using a 3000 km cutoff distance (the cutoff distance needs to be specified in meters)
+# Calculate PAD results using a 3000 km great-circle cutoff (specified in metres)
 # ------------------------------------------------------------------------------------------------------------------------
 
 # if the fields are on different grids, supply also lat2 and lon2 arrays, and set same_grid=False.
@@ -119,17 +119,18 @@ hist = np.histogram(
 )
 PAD_PDF = np.asarray([hist[1][:-1], hist[0][:]]).transpose(1, 0)
 fig, ax = plt.subplots()
-plt.fill_between(PAD_PDF[:, 0] / 1000, PAD_PDF[:, 1], 0, linestyle="-")
+# Convert density per metre to density per kilometre to match the x-axis.
+plt.fill_between(PAD_PDF[:, 0] / 1000, PAD_PDF[:, 1] * 1000, 0, linestyle="-")
 plt.axvline(
     PAD_distance_value / 1000,
     color="navy",
     label="PAD_distance = " + str(int(np.round(PAD_distance_value / 1000, 0))) + " km",
     linestyle="--",
 )
-plt.ylim(bottom=0, top=1.2 * np.max(PAD_PDF[10:, 1]))
+plt.ylim(bottom=0, top=1.2 * np.max(PAD_PDF[10:, 1]) * 1000)
 plt.xlim(left=0)
 plt.xlabel("PAD attribution distance [km]")
-plt.ylabel("PDF")
+plt.ylabel("Probability density [km⁻¹]")
 leg = plt.legend(loc="upper right")
 plt.show()
 plt.close()
