@@ -283,11 +283,13 @@ def calculate_attributions_from_xarrays(
         positive value each. Must have a single ``gridpoint`` dimension and
         one-dimensional ``lat`` and ``lon`` coordinates in degrees.
     area : xarray.DataArray
-        Grid-cell area of ``fcst`` in km^2, strictly positive, aligned with
-        ``fcst``.
+        Grid-cell area of ``fcst`` in km^2, nonnegative, aligned with
+        ``fcst``. Tiny negative areas, within 1e-6 of the largest area (e.g.
+        float32 rounding of cos(lat) at the poles), are treated as zero.
+        Zero-area cells hold no volume and get a residual error of 0 mm.
     area2 : xarray.DataArray, optional
-        Grid-cell area of ``obs`` in km^2. Required if ``same_grid=False`` and
-        not allowed if ``same_grid=True``.
+        Grid-cell area of ``obs`` in km^2, with the same rules as ``area``.
+        Required if ``same_grid=False`` and not allowed if ``same_grid=True``.
     same_grid : bool, default True
         Whether ``fcst`` and ``obs`` are on the same grid, i.e. identical
         lat/lon in identical order.
@@ -378,14 +380,18 @@ def calculate_attributions_from_xarrays(
 
     # Compute water volume (in m^3) from tp (or height in mm) and grid-cell area (in km^2)
     # vol_in_m3 = tp_in_mm / 1000 * area_in_km2 * 1000 * 1000
-    amounts = []
+    amounts, cell_areas = [], []
     for field, cell_area, name in ((fcst, area, "fcst"), (obs, area2, "obs")):
         precipitation = _array(field.values, name)
         areas = _array(cell_area.values, name + " area")
-        if np.any(precipitation < 0) or np.any(areas <= 0):
-            raise ValueError("Precipitation must be nonnegative and cell areas strictly positive.")
+        # Treat areas within rounding error of zero as zero, e.g. cos(90 deg) computed
+        # from float32 latitudes is about -4e-8 instead of 0.
+        areas = np.where(np.abs(areas) <= 1e-6 * np.abs(areas).max(), 0.0, areas)
+        if np.any(precipitation < 0) or np.any(areas < 0):
+            raise ValueError("Precipitation and cell areas must be nonnegative.")
         with np.errstate(over="raise", invalid="raise"):
             amounts.append(precipitation * areas * 1000.0)
+        cell_areas.append(areas)
 
     # Convert cutoff from km to m
     distance_cutoff = _cutoff(_cutoff(cutoff) * 1000.0)
@@ -406,22 +412,26 @@ def calculate_attributions_from_xarrays(
     def residual_ds(remaining, field, cell_area):
         # Convert residual error back from volume (in m^3) to height (in mm)
         # error_mm = error_m3 / (area_km2 * 1000 * 1000) * 1000
+        # Zero-area cells hold no volume, so their error is 0 mm.
+        error = np.divide(
+            remaining, cell_area, out=np.zeros_like(remaining), where=cell_area > 0
+        ) / 1000.0
         coords = {"lat": field.lat.astype(np.float64), "lon": field.lon.astype(np.float64)}
         if "gridpoint" in field.coords:
             coords["gridpoint"] = field.gridpoint
         return xr.Dataset(
-            {"error": ("gridpoint", remaining / cell_area.values / 1000.0)},
+            {"error": ("gridpoint", error)},
             coords=coords,
         )
 
     if not same_grid:
         return (
             transport,
-            residual_ds(remaining1, fcst, area),
-            residual_ds(remaining2, obs, area2),
+            residual_ds(remaining1, fcst, cell_areas[0]),
+            residual_ds(remaining2, obs, cell_areas[1]),
         )
 
-    residual = residual_ds(remaining1 - remaining2, fcst, area)
+    residual = residual_ds(remaining1 - remaining2, fcst, cell_areas[0])
     if gridded_output:
         # Transport-plan gridpoints are positional indices, so combine positionally.
         transport_ds = (
@@ -432,7 +442,7 @@ def calculate_attributions_from_xarrays(
         gridded_ds = xr.merge((
             transport_ds.drop_vars("gridpoint"),
             residual.drop_vars("gridpoint", errors="ignore"),
-        ))
+        ), compat="no_conflicts")
         return transport, gridded_ds
 
     residual = residual.to_dataframe()[["lat", "lon", "error"]]
