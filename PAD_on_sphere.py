@@ -45,10 +45,27 @@ libc.calculate_PAD_results_assume_different_grid_ctypes.restype = ct.POINTER(ct.
 
 
 def check_input_array(f, name):
-    """Validate a nonempty, finite, one-dimensional real NumPy array.
+    """Check that an input numpy array has the right dimension and contents.
 
-    Returns True on success; raises TypeError or ValueError on invalid input.
-    Masked arrays are deliberately rejected.
+    Parameters
+    ----------
+    f : numpy.ndarray
+        Array to check.
+    name : str
+        Name of the parameter, used in error messages.
+
+    Returns
+    -------
+    bool
+        True if all checks pass.
+
+    Raises
+    ------
+    TypeError
+        If ``f`` is not a numpy array, is a masked array, or does not contain
+        real numeric values.
+    ValueError
+        If ``f`` is empty, not one-dimensional, or contains non-finite values.
     """
     if not isinstance(f, np.ndarray) or isinstance(f, np.ma.MaskedArray):
         raise TypeError(f"{name} must be an unmasked NumPy array.")
@@ -91,20 +108,59 @@ def calculate_attributions_from_numpy(
     values1, values2, lat1, lon1, lat2=None, lon2=None,
     same_grid=True, distance_cutoff=100 * 1000 * 1000, random_seed=None,
 ):
-    """Calculate PAD attributions from one-dimensional arrays.
+    """Compute precipitation attributions (i.e. the optimal transport plan) with the PAD-on-sphere method from numpy arrays.
 
-    Latitude/longitude are degrees. Amounts must be finite and nonnegative,
-    with at least one positive amount per field. They are attributed as supplied:
-    pass volumes for volume-weighted PAD; no area conversion occurs here.
-    distance_cutoff is a great-circle distance in metres (zero is allowed).
-    random_seed=None or -1 chooses and prints a random seed; an explicit uint32
-    seed gives reproducibility with identical inputs and code/library versions.
+    Parameters
+    ----------
+    values1, values2 : numpy.ndarray
+        One-dimensional amounts of field1 and field2. They must be finite and
+        nonnegative, with at least one positive value per field. Values are
+        attributed as supplied, with no area weighting: pass volumes (e.g.
+        precipitation in mm times grid-cell area) for a volume-weighted PAD.
+    lat1, lon1 : numpy.ndarray
+        One-dimensional latitudes and longitudes of field1, in degrees.
+    lat2, lon2 : numpy.ndarray, optional
+        Latitudes and longitudes of field2, in degrees. Required if
+        ``same_grid=False`` and not allowed if ``same_grid=True``.
+    same_grid : bool, default True
+        Whether both fields are on the same grid, i.e. identical coordinates
+        in identical order.
+    distance_cutoff : float, default 1e8
+        Great-circle cutoff distance in metres. The default (100,000 km)
+        effectively means no cutoff. Zero is allowed; negative values are not.
+    random_seed : int, optional
+        Seed for the random choices made during attribution. ``None`` or -1
+        chooses a random seed and prints it. An unsigned 32-bit integer gives
+        reproducible results for identical inputs and code/library versions.
 
-    Returns [attributions, remaining1, remaining2]. Attribution shape is (N, 4),
-    including (0, 4) when no matches satisfy the cutoff. Columns are great-circle
-    distance in metres, amount, original index1, original index2. Indices in this
-    homogeneous float64 array are exactly representable for the supported sizes.
-    same_grid=True means identical coordinates in identical order.
+    Returns
+    -------
+    list of numpy.ndarray
+        ``[attributions, remaining1, remaining2]``:
+
+        - ``attributions``: float64 array of shape (N, 4), with columns
+          great-circle distance (m), attributed amount, index in field1 and
+          index in field2. Shape is (0, 4) if no attributions satisfy the cutoff.
+        - ``remaining1``, ``remaining2``: non-attributed amounts of field1 and
+          field2, with the same shapes as ``values1`` and ``values2``.
+
+    Raises
+    ------
+    TypeError
+        If inputs are not unmasked real numpy arrays, or ``same_grid`` or
+        ``random_seed`` have the wrong type.
+    ValueError
+        If arrays are empty, not one-dimensional, non-finite or of mismatched
+        shapes; if amounts are negative or all zero; if latitudes are outside
+        [-90, 90]; or if ``lat2``/``lon2`` do not match ``same_grid``.
+    RuntimeError
+        If the C++ library reports an error.
+
+    References
+    ----------
+    Skok, G. & Lledó, L. (2025) Spatial verification of global precipitation
+    forecasts. Quarterly Journal of the Royal Meteorological Society.
+    https://doi.org/10.1002/qj.5006
     """
     if not isinstance(same_grid, (bool, np.bool_)):
         raise TypeError("same_grid must be a boolean.")
@@ -167,7 +223,27 @@ def calculate_attributions_from_numpy(
 
 
 def calculate_PAD_on_sphere_from_attributions(PAD_attributions):
-    """Return the amount-weighted mean distance; reject undefined/invalid input."""
+    """Compute the PAD value as the volume-weighted mean of the attribution distances.
+
+    Parameters
+    ----------
+    PAD_attributions : array_like
+        Two-dimensional array with distances in the first column and attributed
+        amounts (weights) in the second, e.g. the ``attributions`` returned by
+        `calculate_attributions_from_numpy`. Extra columns are ignored.
+
+    Returns
+    -------
+    float
+        Volume-weighted mean distance, in the units of the first column
+        (metres for the arrays returned by this package).
+
+    Raises
+    ------
+    ValueError
+        If the array is empty or has fewer than two columns, contains
+        non-finite or negative values, or all weights are zero.
+    """
     rows = np.asarray(PAD_attributions, dtype=np.float64)
     if rows.ndim != 2 or rows.shape[1] < 2 or rows.shape[0] == 0:
         raise ValueError("PAD requires a nonempty attribution array with at least two columns.")
@@ -198,22 +274,82 @@ def calculate_attributions_from_xarrays(
     fcst, obs, area, area2=None, same_grid=True, cutoff=3000,
     gridded_output=True, random_seed=None,
 ):
-    """Calculate PAD for precipitation (mm) and cell areas (km^2).
+    """Compute precipitation attributions (i.e. the optimal transport plan) with the PAD-on-sphere method from xarray DataArrays.
 
-    cutoff is great-circle distance in km.
-    random_seed follows calculate_attributions_from_numpy.
-    distance_m is stored as an integer (truncated to whole metres) to save output
-    storage; 1 m resolution is enough. Index columns are integers.
-    Returns, depending on the options:
-    - same_grid=True, gridded_output=True: (transport_dataframe, gridded_ds), with
-      volume transported, distance transported and residual error (mm) at each grid point.
-    - same_grid=True, gridded_output=False: (transport_dataframe, residual_dataframe)
-      with the non-zero residual errors in mm.
-    - same_grid=False: (transport_dataframe, residual_fcst_ds, residual_obs_ds) with
-      the non-attributed precipitation in mm on each grid.
-    For the gridded outputs, positive distances represent a water export at origin
-    (fcst > obs) and negative distances a water import at destination (fcst < obs).
-    Similarly, positive residual errors represent overforecasting (fcst > obs) and vice versa.
+    Parameters
+    ----------
+    fcst, obs : xarray.DataArray
+        Total precipitation in mm, finite and nonnegative, with at least one
+        positive value each. Must have a single ``gridpoint`` dimension and
+        one-dimensional ``lat`` and ``lon`` coordinates in degrees.
+    area : xarray.DataArray
+        Grid-cell area of ``fcst`` in km^2, strictly positive, aligned with
+        ``fcst``.
+    area2 : xarray.DataArray, optional
+        Grid-cell area of ``obs`` in km^2. Required if ``same_grid=False`` and
+        not allowed if ``same_grid=True``.
+    same_grid : bool, default True
+        Whether ``fcst`` and ``obs`` are on the same grid, i.e. identical
+        lat/lon in identical order.
+    cutoff : float, default 3000
+        Great-circle cutoff distance in km.
+    gridded_output : bool, default True
+        If True, return the per-gridpoint summary as an xarray Dataset;
+        otherwise return the residual errors as a pandas DataFrame. Only used
+        if ``same_grid=True``.
+    random_seed : int, optional
+        Seed for the random choices made during attribution. ``None`` or -1
+        chooses a random seed and prints it. An unsigned 32-bit integer gives
+        reproducible results for identical inputs and code/library versions.
+
+    Returns
+    -------
+    transport : pandas.DataFrame
+        All attributions, with columns ``distance_m`` (int64, great-circle
+        distance in m), ``volume_m3`` (float64), ``gridpoint_fcst`` and
+        ``gridpoint_obs`` (int64, positional indices 0..n-1 into ``fcst``
+        and ``obs``).
+    gridded_ds : xarray.Dataset
+        Only if ``same_grid=True`` and ``gridded_output=True``. Variables
+        ``volume`` (m^3 transported), ``distance`` (volume-weighted mean
+        distance in m) and ``error`` (residual error in mm) at each grid point.
+    residual_df : pandas.DataFrame
+        Only if ``same_grid=True`` and ``gridded_output=False``. Columns
+        ``lat``, ``lon`` and ``error`` (mm) for grid points with non-zero
+        residual error, indexed by ``gridpoint``.
+    residual_fcst_ds, residual_obs_ds : xarray.Dataset
+        Only if ``same_grid=False``. Variable ``error`` with the non-attributed
+        precipitation (mm) of ``fcst`` and ``obs`` on their own grids.
+
+    Raises
+    ------
+    TypeError
+        If ``same_grid`` or ``random_seed`` have the wrong type, or the data
+        are not real numeric values.
+    ValueError
+        If inputs are not DataArrays with the expected dimension and
+        coordinates, are not aligned with their areas, contain negative or
+        non-finite values or non-positive areas, if a field is all zero, or if
+        ``area2`` does not match ``same_grid``.
+    RuntimeError
+        If the C++ library reports an error.
+
+    Notes
+    -----
+    In the gridded output, positive distances represent water exported from a
+    grid point (fcst > obs) and negative distances water imported into it
+    (fcst < obs). Positive residual errors represent overforecasting
+    (fcst > obs, "false alarm") and negative ones underforecasting
+    (fcst < obs, "miss").
+
+    ``distance_m`` is truncated to whole metres and stored as an integer to
+    save output storage; 1 m resolution is enough for attribution distances.
+
+    References
+    ----------
+    Skok, G. & Lledó, L. (2025) Spatial verification of global precipitation
+    forecasts. Quarterly Journal of the Royal Meteorological Society.
+    https://doi.org/10.1002/qj.5006
     """
     if not isinstance(same_grid, (bool, np.bool_)):
         raise TypeError("same_grid must be a boolean.")
@@ -240,6 +376,8 @@ def calculate_attributions_from_xarrays(
             if not np.array_equal(fcst[coordinate].values, obs[coordinate].values):
                 raise ValueError("Same-grid fields must have identical lat/lon coordinates in the same order.")
 
+    # Compute water volume (in m^3) from tp (or height in mm) and grid-cell area (in km^2)
+    # vol_in_m3 = tp_in_mm / 1000 * area_in_km2 * 1000 * 1000
     amounts = []
     for field, cell_area, name in ((fcst, area, "fcst"), (obs, area2, "obs")):
         precipitation = _array(field.values, name)
@@ -249,6 +387,7 @@ def calculate_attributions_from_xarrays(
         with np.errstate(over="raise", invalid="raise"):
             amounts.append(precipitation * areas * 1000.0)
 
+    # Convert cutoff from km to m
     distance_cutoff = _cutoff(_cutoff(cutoff) * 1000.0)
     attributions, remaining1, remaining2 = calculate_attributions_from_numpy(
         amounts[0], amounts[1], fcst.lat.values, fcst.lon.values,
@@ -265,7 +404,8 @@ def calculate_attributions_from_xarrays(
         transport[column] = transport[column].astype(np.int64)
 
     def residual_ds(remaining, field, cell_area):
-        # Convert volume back to height: mm = m^3 / (km^2 * 1e6) * 1e3
+        # Convert residual error back from volume (in m^3) to height (in mm)
+        # error_mm = error_m3 / (area_km2 * 1000 * 1000) * 1000
         coords = {"lat": field.lat.astype(np.float64), "lon": field.lon.astype(np.float64)}
         if "gridpoint" in field.coords:
             coords["gridpoint"] = field.gridpoint

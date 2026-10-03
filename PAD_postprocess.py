@@ -4,15 +4,28 @@ import xarray as xr
 
 
 def weighted_average(df, data_col, weight_col, by_col):
-    """Fast computation of weighted averages. This is much faster than other groupby/apply methods.
+    """Compute weighted averages per group.
 
-    :param dataframe df: input dataframe containing the columns specified below.
-    :param str data_col: df column to be averaged.
-    :param str weight_col: df column to be used as a weight.
-    :param str by_col: df column to be used as group.
+    Much faster than groupby/apply alternatives. Rows with a missing value in
+    ``data_col`` are left out of both the numerator and the total weight. The
+    input dataframe is not modified.
 
-    :return: pandas dataframe with weighted average for each group.
+    Parameters
+    ----------
+    df : pandas.DataFrame
+        Input dataframe containing the columns below.
+    data_col : str
+        Column to be averaged.
+    weight_col : str
+        Column to be used as weight.
+    by_col : str
+        Column or index level name to group by.
 
+    Returns
+    -------
+    pandas.DataFrame
+        Indexed by the groups of ``by_col``, with columns ``volume`` (sum of
+        weights) and ``distance`` (weighted average of ``data_col``).
     """
     # Preserve grouping by either a column or an index level without modifying
     # the caller's data, even if it already contains our temporary column names.
@@ -27,15 +40,36 @@ def weighted_average(df, data_col, weight_col, by_col):
 
 
 def aggregate_transportplan_at_gridpoints(transportplan_df, latlon_df):
-    """Compute a single attribution value at each gridpoint, representing total mass displaced and the average displacement.
-    Since the transport plan can have multiple displacements starting or ending at the same grid point (Kantorovich relaxation),
-    this is useful to produce plots or grid point statistics.
+    """Aggregate the transport plan into a single attribution value at each grid point.
 
-    :param dataframe transportplan_df: a dataframe with a transport plan.
-    :param dataframe latlon_df: a dataframe with lat/lon coordinates at each gridpoint.
+    The transport plan can have several displacements starting or ending at the
+    same grid point (Kantorovich relaxation). This computes the total volume
+    displaced and the volume-weighted mean displacement at each grid point,
+    which is useful for plots and grid-point statistics. Only meaningful when
+    both fields are on the same grid.
 
-    :return: a dataframe indicating distance and volume displaced at each grid point. Positive distances represent a water export at origin (fcst > obs) and negative distances represent a water import at destination (fcst < obs).
+    Parameters
+    ----------
+    transportplan_df : pandas.DataFrame
+        Transport plan with columns ``distance_m``, ``volume_m3``,
+        ``gridpoint_fcst`` and ``gridpoint_obs``, as returned by
+        `PAD_on_sphere.calculate_attributions_from_xarrays`.
+    latlon_df : pandas.DataFrame
+        Coordinates of every grid point, indexed by ``gridpoint``, as returned
+        by `get_latlon_df`.
 
+    Returns
+    -------
+    pandas.DataFrame
+        Indexed by ``gridpoint`` with one row per grid point in ``latlon_df``,
+        and columns ``volume`` (m^3), ``distance`` (m), ``lat`` and ``lon``.
+        Grid points without attributions have NaN volume and distance.
+
+    Notes
+    -----
+    A grid point either exports or imports water, never both. Positive
+    distances represent water exported from the grid point (fcst > obs), and
+    negative distances water imported into it (fcst < obs).
     """
     # Aggregate all displacements that started (fcst) or ended (obs) in each grid point
     dist_df_at_fcst = weighted_average(
@@ -64,37 +98,70 @@ def aggregate_transportplan_at_gridpoints(transportplan_df, latlon_df):
 
 
 def postprocess_residue_df(residue_df, latlon_df):
-    """Postprocess the bias dataframe to ensure that all grid-points are present. Empty points are filled up with nan.
+    """Expand a residual-error dataframe to all grid points.
 
-    :param dataframe residue_df: a dataframe with non-attributed precipitation.
-    :param dataframe latlon_df: a dataframe with all lat and lon coordinates.
+    Parameters
+    ----------
+    residue_df : pandas.DataFrame
+        Non-attributed precipitation with an ``error`` column, indexed by
+        ``gridpoint``, e.g. as returned by
+        `PAD_on_sphere.calculate_attributions_from_xarrays` with
+        ``gridded_output=False``.
+    latlon_df : pandas.DataFrame
+        Coordinates of every grid point, indexed by ``gridpoint``, as returned
+        by `get_latlon_df`.
 
-    :return: a pandas dataframe with nan values for the gridpoints without unattributed precipitation.
-
+    Returns
+    -------
+    pandas.DataFrame
+        Indexed by ``gridpoint`` with columns ``error``, ``lat`` and ``lon``
+        for every grid point. Grid points missing from ``residue_df`` get NaN.
     """
     return pd.merge(residue_df.error, latlon_df, how="right", on="gridpoint")
 
 
 def get_latlon_df(da):
-    """Get lat lon coordinates from an xarray dataarray and return them as a pandas dataframe.
+    """Get the lat/lon coordinates of a DataArray as a pandas dataframe.
 
-    :param dataarray da: a dataarray with lat and lon coordinates.
+    Parameters
+    ----------
+    da : xarray.DataArray
+        DataArray with one-dimensional ``lat`` and ``lon`` coordinates along
+        its grid-point dimension.
 
-    :return: a pandas dataframe with gridpoint, lat and lon columns.
-
+    Returns
+    -------
+    pandas.DataFrame
+        Columns ``lat`` and ``lon``, indexed by ``gridpoint``. The index is
+        positional (0..n-1), matching the gridpoint indices of the transport
+        plan, regardless of any ``gridpoint`` coordinate on ``da``.
     """
     return pd.DataFrame({"lat": da.lat, "lon": da.lon}).rename_axis("gridpoint")
 
 
 def compute_regional_stats(gridded_ds, region_masks, area):
-    """Compute location error statistics for several domains.
+    """Compute location and residual error statistics for several regions.
 
-    :param dataset gridded_ds: an xarray Dataset with distance (in m), volume (in m^3) attributed, and unattributed precipitation in mm at each gridpoint.
-    :param dataarray region_masks: a boolean xarray DataArray with the region masks, indication which gridpoints belong to each of the regions.
-    :param dataarray area: an xarray DataArray indicating the area of each grid cell.
+    Parameters
+    ----------
+    gridded_ds : xarray.Dataset
+        Per-gridpoint summary with ``distance`` (m), ``volume`` (m^3) and
+        ``error`` (mm), as returned by
+        `PAD_on_sphere.calculate_attributions_from_xarrays` with
+        ``gridded_output=True``.
+    region_masks : xarray.DataArray
+        Boolean masks with a ``gridpoint`` dimension and a region dimension,
+        indicating which grid points belong to each region.
+    area : xarray.DataArray
+        Area of each grid cell along ``gridpoint``. Only used as weights, so
+        any unit works.
 
-    :return: an xarray Dataset with volume-weighted mean distance and mean absolute error for each region.
-
+    Returns
+    -------
+    xarray.Dataset
+        For each region, ``mean_distance`` (volume-weighted mean absolute
+        distance, in km) and ``residual_mae`` (area-weighted mean absolute
+        residual error, in mm).
     """
 
     LocationError = (
