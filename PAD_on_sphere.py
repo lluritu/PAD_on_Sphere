@@ -12,6 +12,8 @@ import numpy as np
 import pandas as pd
 import xarray as xr
 
+from PAD_postprocess import aggregate_transportplan_at_gridpoints, get_latlon_df
+
 Earth_radius = 6371.0 * 1000.0
 libc = ct.CDLL(str(Path(__file__).resolve().parent / "PAD_on_sphere_Cxx_shared_library.so"))
 try:
@@ -194,17 +196,23 @@ def _dataarray(array, name, coordinates=False):
 
 def calculate_attributions_from_xarrays(
     fcst, obs, area, area2=None, same_grid=True, cutoff=3000,
-    residual_as_df=False, random_seed=None,
+    gridded_output=True, random_seed=None,
 ):
     """Calculate PAD for precipitation (mm) and cell areas (km^2).
 
     cutoff is great-circle distance in km.
     random_seed follows calculate_attributions_from_numpy.
-    Returns (transport_dataframe, residual). Distances retain floating-point
-    precision in metres; index columns are integers. For same grids, residual
-    is a Dataset in mm (or a filtered DataFrame with residual_as_df=True).
-    For different grids, residual is [remaining_forecast, remaining_observation]
-    in m^3; residual_as_df is not supported.
+    Distances retain floating-point precision in metres; index columns are integers.
+    Returns, depending on the options:
+    - same_grid=True, gridded_output=True: (transport_dataframe, gridded_ds), with
+      volume transported, distance transported and residual error (mm) at each grid point.
+    - same_grid=True, gridded_output=False: (transport_dataframe, residual_dataframe)
+      with the non-zero residual errors in mm.
+    - same_grid=False: (transport_dataframe, residual_fcst_ds, residual_obs_ds) with
+      the non-attributed precipitation in mm on each grid.
+    For the gridded outputs, positive distances represent a water export at origin
+    (fcst > obs) and negative distances a water import at destination (fcst < obs).
+    Similarly, positive residual errors represent overforecasting (fcst > obs) and vice versa.
     """
     if not isinstance(same_grid, (bool, np.bool_)):
         raise TypeError("same_grid must be a boolean.")
@@ -215,8 +223,6 @@ def calculate_attributions_from_xarrays(
         if area2 is not None:
             raise ValueError("Do not supply area2 when same_grid=True.")
         area2 = area
-    elif residual_as_df:
-        raise ValueError("residual_as_df is supported only for same-grid fields.")
     _dataarray(area2, "area2")
 
     # Exact joins reject different/reordered indexes instead of silently dropping
@@ -254,17 +260,37 @@ def calculate_attributions_from_xarrays(
     )
     for column in ("gridpoint_fcst", "gridpoint_obs"):
         transport[column] = transport[column].astype(np.int64)
-    if not same_grid:
-        return transport, [remaining1, remaining2]
 
-    coords = {"lat": fcst.lat, "lon": fcst.lon}
-    if "gridpoint" in fcst.coords:
-        coords["gridpoint"] = fcst.gridpoint
-    residual = xr.Dataset(
-        {"error": ("gridpoint", (remaining1 - remaining2) / _array(area.values, "area") / 1000.0)},
-        coords=coords,
-    )
-    if residual_as_df:
-        residual = residual.to_dataframe()
-        residual = residual.loc[residual["error"] != 0]
-    return transport, residual
+    def residual_ds(remaining, field, cell_area):
+        # Convert volume back to height: mm = m^3 / (km^2 * 1e6) * 1e3
+        coords = {"lat": field.lat.astype(np.float64), "lon": field.lon.astype(np.float64)}
+        if "gridpoint" in field.coords:
+            coords["gridpoint"] = field.gridpoint
+        return xr.Dataset(
+            {"error": ("gridpoint", remaining / cell_area.values / 1000.0)},
+            coords=coords,
+        )
+
+    if not same_grid:
+        return (
+            transport,
+            residual_ds(remaining1, fcst, area),
+            residual_ds(remaining2, obs, area2),
+        )
+
+    residual = residual_ds(remaining1 - remaining2, fcst, area)
+    if gridded_output:
+        # Transport-plan gridpoints are positional indices, so combine positionally.
+        transport_ds = (
+            aggregate_transportplan_at_gridpoints(transport, get_latlon_df(residual))
+            .to_xarray()
+            .set_coords(("lat", "lon"))
+        )
+        gridded_ds = xr.merge((
+            transport_ds.drop_vars("gridpoint"),
+            residual.drop_vars("gridpoint", errors="ignore"),
+        ))
+        return transport, gridded_ds
+
+    residual = residual.to_dataframe()[["lat", "lon", "error"]]
+    return transport, residual.loc[residual["error"] != 0]
