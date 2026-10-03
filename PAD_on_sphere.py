@@ -202,7 +202,8 @@ def calculate_attributions_from_xarrays(
 
     cutoff is great-circle distance in km.
     random_seed follows calculate_attributions_from_numpy.
-    Distances retain floating-point precision in metres; index columns are integers.
+    distance_m is stored as an integer (truncated to whole metres) to save output
+    storage; 1 m resolution is enough. Index columns are integers.
     Returns, depending on the options:
     - same_grid=True, gridded_output=True: (transport_dataframe, gridded_ds), with
       volume transported, distance transported and residual error (mm) at each grid point.
@@ -258,7 +259,9 @@ def calculate_attributions_from_xarrays(
     transport = pd.DataFrame(
         attributions, columns=["distance_m", "volume_m3", "gridpoint_fcst", "gridpoint_obs"]
     )
-    for column in ("gridpoint_fcst", "gridpoint_obs"):
+    # Store distance and gridpoint columns as integers. For distance_m this truncates
+    # to whole metres, which saves output storage; 1 m resolution is enough here.
+    for column in ("distance_m", "gridpoint_fcst", "gridpoint_obs"):
         transport[column] = transport[column].astype(np.int64)
 
     def residual_ds(remaining, field, cell_area):
