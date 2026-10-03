@@ -12,7 +12,11 @@ import numpy as np
 import pandas as pd
 import xarray as xr
 
-from PAD_postprocess import aggregate_transportplan_at_gridpoints, get_latlon_df
+from PAD_postprocess import (
+    aggregate_transportplan_at_gridpoints,
+    aggregate_transportplan_at_gridpoints_unequal_grids,
+    get_latlon_df,
+)
 
 Earth_radius = 6371.0 * 1000.0
 libc = ct.CDLL(str(Path(__file__).resolve().parent / "PAD_on_sphere_Cxx_shared_library.so"))
@@ -296,9 +300,9 @@ def calculate_attributions_from_xarrays(
     cutoff : float, default 3000
         Great-circle cutoff distance in km.
     gridded_output : bool, default True
-        If True, return the per-gridpoint summary as an xarray Dataset;
-        otherwise return the residual errors as a pandas DataFrame. Only used
-        if ``same_grid=True``.
+        If True, include the per-gridpoint volume and distance of the
+        attributions in the returned datasets. If False, return only the
+        residual errors, as a pandas DataFrame if ``same_grid=True``.
     random_seed : int, optional
         Seed for the random choices made during attribution. ``None`` or -1
         chooses a random seed and prints it. An unsigned 32-bit integer gives
@@ -319,9 +323,16 @@ def calculate_attributions_from_xarrays(
         Only if ``same_grid=True`` and ``gridded_output=False``. Columns
         ``lat``, ``lon`` and ``error`` (mm) for grid points with non-zero
         residual error, indexed by ``gridpoint``.
+    gridded_fcst_ds, gridded_obs_ds : xarray.Dataset
+        Only if ``same_grid=False`` and ``gridded_output=True``. Per-gridpoint
+        summary on each grid: ``volume`` (m^3) and ``distance`` (m) of the water
+        exported from each fcst grid point (positive) and imported into each obs
+        grid point (negative), and ``error`` with the non-attributed
+        precipitation (mm).
     residual_fcst_ds, residual_obs_ds : xarray.Dataset
-        Only if ``same_grid=False``. Variable ``error`` with the non-attributed
-        precipitation (mm) of ``fcst`` and ``obs`` on their own grids.
+        Only if ``same_grid=False`` and ``gridded_output=False``. Variable
+        ``error`` with the non-attributed precipitation (mm) of ``fcst`` and
+        ``obs`` on their own grids.
 
     Raises
     ------
@@ -425,11 +436,22 @@ def calculate_attributions_from_xarrays(
         )
 
     if not same_grid:
-        return (
-            transport,
-            residual_ds(remaining1, fcst, cell_areas[0]),
-            residual_ds(remaining2, obs, cell_areas[1]),
+        residual_fcst = residual_ds(remaining1, fcst, cell_areas[0])
+        residual_obs = residual_ds(remaining2, obs, cell_areas[1])
+        if not gridded_output:
+            return transport, residual_fcst, residual_obs
+        # Transport-plan gridpoints are positional indices, so combine positionally,
+        # keeping the residual's gridpoint coordinate as before.
+        transport_fcst, transport_obs = aggregate_transportplan_at_gridpoints_unequal_grids(
+            transport, get_latlon_df(residual_fcst), get_latlon_df(residual_obs)
         )
+        gridded_fcst, gridded_obs = (
+            xr.merge((transport_ds.drop_vars("gridpoint"), residual), compat="no_conflicts")
+            for transport_ds, residual in (
+                (transport_fcst, residual_fcst), (transport_obs, residual_obs)
+            )
+        )
+        return transport, gridded_fcst, gridded_obs
 
     residual = residual_ds(remaining1 - remaining2, fcst, cell_areas[0])
     if gridded_output:

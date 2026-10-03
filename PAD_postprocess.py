@@ -97,6 +97,52 @@ def aggregate_transportplan_at_gridpoints(transportplan_df, latlon_df):
     return dist_df
 
 
+def aggregate_transportplan_at_gridpoints_unequal_grids(transportplan_df, latlon_fcst_df, latlon_obs_df):
+    """Aggregate the transport plan into a single attribution value at each grid point, for unequal grids.
+
+    Counterpart of `aggregate_transportplan_at_gridpoints` for fields on
+    different grids. Exports are aggregated on the fcst grid and imports on the
+    obs grid, giving one dataset per grid.
+
+    Parameters
+    ----------
+    transportplan_df : pandas.DataFrame
+        Transport plan with columns ``distance_m``, ``volume_m3``,
+        ``gridpoint_fcst`` and ``gridpoint_obs``, as returned by
+        `PAD_on_sphere.calculate_attributions_from_xarrays`.
+    latlon_fcst_df, latlon_obs_df : pandas.DataFrame
+        Coordinates of every fcst and obs grid point, indexed by
+        ``gridpoint``, as returned by `get_latlon_df`.
+
+    Returns
+    -------
+    fcst_ds, obs_ds : xarray.Dataset
+        One dataset per grid, along ``gridpoint`` with ``lat``/``lon``
+        coordinates, and variables ``volume`` (m^3) and ``distance`` (m).
+        Grid points without attributions have NaN volume and distance.
+
+    Notes
+    -----
+    Signs follow `aggregate_transportplan_at_gridpoints`: distances are
+    positive on the fcst grid (water exported, fcst > obs) and negative on
+    the obs grid (water imported, fcst < obs).
+    """
+    datasets = []
+    for column, latlon_df, sign in (
+        ("gridpoint_fcst", latlon_fcst_df, 1),
+        ("gridpoint_obs", latlon_obs_df, -1),
+    ):
+        dist_df = weighted_average(transportplan_df, "distance_m", "volume_m3", column)
+        dist_df["distance"] = dist_df["distance"] * sign
+        dist_df = pd.merge(
+            dist_df, latlon_df, how="right", left_on=column, right_on="gridpoint"
+        )
+        datasets.append(
+            dist_df.rename_axis("gridpoint").to_xarray().set_coords(("lat", "lon"))
+        )
+    return tuple(datasets)
+
+
 def postprocess_residue_df(residue_df, latlon_df):
     """Expand a residual-error dataframe to all grid points.
 
